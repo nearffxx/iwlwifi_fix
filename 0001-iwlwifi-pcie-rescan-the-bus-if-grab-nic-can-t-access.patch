@@ -1,0 +1,146 @@
+From dccc0f3e01caca7450e3465f395a1785c27b39af Mon Sep 17 00:00:00 2001
+From: Chengyu Zheng <chengyu.zheng@polimi.it>
+Date: Tue, 26 Dec 2017 15:22:15 +0100
+Subject: [PATCH] iwlwifi: pcie: rescan the bus if grab nic can't access the
+ device
+
+If we fail to to grab NIC access because the device is not responding
+(i.e. CSR_GP_CNTRL returns 0xFFFFFFFF), try to rescan the device's bus
+to see if it recovers.
+
+BUG=b:35648315
+TEST=While the interface is up, physically disconnect the NIC for as
+     short time as possible (preferrably < 1 sec); then wait a few
+     seconds, bring the interface up again and issue a scan.  The
+     device should recover and the scan results should be shown.  In
+     the kernel messages it is possible to see some warnings (from the
+     detection that the device was removed) and the recovery flow.
+
+Change-Id: I9ab7d6b158a1e7948767b90abef23f5f6df3523c
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+iwl7000-tree: 247e4dd44db297d8ff11247d021523986689e78d
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+---
+ drivers/net/wireless/intel/iwlwifi/pcie/internal.h |  2 +
+ drivers/net/wireless/intel/iwlwifi/pcie/trans.c    | 74 +++++++++++++++++++++-
+ 2 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/internal.h b/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
+index 4fb7647995c3..dc8ef368d886 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
+@@ -383,6 +383,7 @@ struct iwl_self_init_dram {
+  * @hw_init_mask: initial unmasked hw causes
+  * @fh_mask: current unmasked fh causes
+  * @hw_mask: current unmasked hw causes
++ * @in_rescan: true if we have triggered a device rescan
+  */
+ struct iwl_trans_pcie {
+ 	struct iwl_rxq *rxq;
+@@ -463,6 +464,7 @@ struct iwl_trans_pcie {
+ 	u32 fh_mask;
+ 	u32 hw_mask;
+ 	cpumask_t affinity_mask[IWL_MAX_RX_HW_QUEUES];
++	bool in_rescan;
+ };
+
+ static inline struct iwl_trans_pcie *
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+index 2e3e013ec95a..fbf923918ac0 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+@@ -73,6 +73,7 @@
+ #include <linux/gfp.h>
+ #include <linux/vmalloc.h>
+ #include <linux/pm_runtime.h>
++#include <linux/module.h>
+
+ #include "iwl-drv.h"
+ #include "iwl-trans.h"
+@@ -1826,6 +1827,30 @@ static void iwl_trans_pcie_set_pmi(struct iwl_trans *trans, bool state)
+ 		clear_bit(STATUS_TPOWER_PMI, &trans->status);
+ }
+
++struct iwl_trans_pcie_rescan {
++	struct device *dev;
++	struct work_struct work;
++};
++
++static void iwl_trans_pcie_rescan_wk(struct work_struct *wk)
++{
++	struct iwl_trans_pcie_rescan *rescan;
++	struct pci_dev *pdev;
++
++	rescan = container_of(wk, struct iwl_trans_pcie_rescan, work);
++
++	pdev = to_pci_dev(rescan->dev);
++
++	pci_stop_and_remove_bus_device_locked(pdev);
++
++	pci_lock_rescan_remove();
++	pci_rescan_bus(pdev->bus->parent);
++	pci_unlock_rescan_remove();
++
++	kfree(rescan);
++	module_put(THIS_MODULE);
++}
++
+ static bool iwl_trans_pcie_grab_nic_access(struct iwl_trans *trans,
+ 					   unsigned long *flags)
+ {
+@@ -1868,10 +1898,50 @@ static bool iwl_trans_pcie_grab_nic_access(struct iwl_trans *trans,
+ 			   (CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY |
+ 			    CSR_GP_CNTRL_REG_FLAG_GOING_TO_SLEEP), 15000);
+ 	if (unlikely(ret < 0)) {
+-		iwl_write32(trans, CSR_RESET, CSR_RESET_REG_FLAG_FORCE_NMI);
++		u32 cntrl = iwl_read32(trans, CSR_GP_CNTRL);
+ 		WARN_ONCE(1,
+ 			  "Timeout waiting for hardware access (CSR_GP_CNTRL 0x%08x)\n",
+-			  iwl_read32(trans, CSR_GP_CNTRL));
++			  cntrl);
++
++		if (cntrl == 0xffffffff) {
++			struct iwl_trans_pcie_rescan *rescan;
++
++			if (trans_pcie->in_rescan)
++				goto err;
++			/*
++			 * we don't need to clear this flag, because
++			 * the trans will be freed and reallocated.
++			*/
++			trans_pcie->in_rescan = true;
++
++			IWL_ERR(trans, "Device disconnected - rescan!\n");
++
++			/*
++			 * get a module reference to avoid doing this
++			 * while unloading anyway and to avoid
++			 * scheduling a work with code that's being
++			 * removed.
++			 */
++			if (!try_module_get(THIS_MODULE)) {
++				IWL_ERR(trans,
++					"Module is being unloaded - abort\n");
++				goto err;
++			}
++
++			rescan = kzalloc(sizeof(*rescan), GFP_ATOMIC);
++			if (!rescan) {
++				module_put(THIS_MODULE);
++				goto err;
++			}
++			rescan->dev = trans->dev;
++			INIT_WORK(&rescan->work, iwl_trans_pcie_rescan_wk);
++			schedule_work(&rescan->work);
++		} else {
++			iwl_write32(trans, CSR_RESET,
++				CSR_RESET_REG_FLAG_FORCE_NMI);
++		}
++
++err:
+ 		spin_unlock_irqrestore(&trans_pcie->reg_lock, *flags);
+ 		return false;
+ 	}
+--
+2.15.1
+
